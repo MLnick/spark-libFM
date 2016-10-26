@@ -1,12 +1,12 @@
 package org.apache.spark.mllib.regression
 
-import org.apache.spark.Logging
-import org.apache.spark.mllib.linalg.{DenseMatrix, Vectors, Vector}
-import org.apache.spark.mllib.optimization.GradientDescent
-import org.apache.spark.rdd.RDD
-import org.apache.spark.storage.StorageLevel
-
+import scala.collection.mutable.ArrayBuffer
 import scala.util.Random
+
+import org.apache.spark.internal.Logging
+import org.apache.spark.mllib.linalg.{DenseMatrix, Vector, Vectors}
+import org.apache.spark.mllib.optimization.{Gradient, GradientDescent, Updater}
+import org.apache.spark.rdd.RDD
 
 /**
   * Created by zrf on 4/24/15.
@@ -39,9 +39,11 @@ object FMWithSGD {
             miniBatchFraction: Double,
             dim: (Boolean, Boolean, Int),
             regParam: (Double, Double, Double),
-            initStd: Double): FMModel = {
+            initStd: Double,
+            treeDepth: Int = 2): FMModel = {
     new FMWithSGD(task, stepSize, numIterations, dim, regParam, miniBatchFraction)
       .setInitStd(initStd)
+      .setTreeDepth(treeDepth)
       .run(input)
   }
 
@@ -60,7 +62,7 @@ class FMWithSGD(private var task: Int,
                 private var numIterations: Int,
                 private var dim: (Boolean, Boolean, Int),
                 private var regParam: (Double, Double, Double),
-                private var miniBatchFraction: Double) extends Serializable with Logging {
+                private var miniBatchFraction: Double) extends Serializable {
 
 
   /**
@@ -83,6 +85,8 @@ class FMWithSGD(private var task: Int,
   private var numFeatures: Int = -1
   private var minLabel: Double = Double.MaxValue
   private var maxLabel: Double = Double.MinValue
+
+  private var treeDepth: Int = 2
 
   /**
     * A (Boolean,Boolean,Int) 3-Tuple stands for whether the global bias term should be used, whether the one-way
@@ -166,6 +170,17 @@ class FMWithSGD(private var task: Int,
     this
   }
 
+  /**
+   * Set the tree depth for aggregation
+   * @param depth
+   * @return
+   */
+  def setTreeDepth(depth: Int): this.type = {
+    require(treeDepth >= 2)
+    this.treeDepth = depth
+    this
+  }
+
 
   /**
     * Encode the FMModel to a dense vector, with its first numFeatures * numFactors elements representing the
@@ -237,12 +252,13 @@ class FMWithSGD(private var task: Int,
 
     val updater = new FMUpdater(k0, k1, k2, r0, r1, r2, numFeatures)
 
+    /*
     val optimizer = new GradientDescent(gradient, updater)
       .setStepSize(stepSize)
       .setNumIterations(numIterations)
       .setMiniBatchFraction(miniBatchFraction)
       .setConvergenceTol(Double.MinPositiveValue)
-
+    */
     val data = task match {
       case 0 =>
         input.map(l => (l.label, l.features)).persist()
@@ -252,8 +268,184 @@ class FMWithSGD(private var task: Int,
 
     val initWeights = generateInitWeights()
 
-    val weights = optimizer.optimize(data, initWeights)
+    val (weights, _) = MyGradientDescent.runMiniBatchSGD(
+      data,
+      gradient,
+      updater,
+      stepSize,
+      numIterations,
+      0.0,
+      1.0,
+      initWeights,
+      Double.MinPositiveValue,
+      2)
 
     createModel(weights)
   }
+}
+
+
+object MyGradientDescent extends Logging {
+  /**
+   * Run stochastic gradient descent (SGD) in parallel using mini batches.
+   * In each iteration, we sample a subset (fraction miniBatchFraction) of the total data
+   * in order to compute a gradient estimate.
+   * Sampling, and averaging the subgradients over this subset is performed using one standard
+   * spark map-reduce in each iteration.
+   *
+   * @param data Input data for SGD. RDD of the set of data examples, each of
+   *             the form (label, [feature values]).
+   * @param gradient Gradient object (used to compute the gradient of the loss function of
+   *                 one single data example)
+   * @param updater Updater function to actually perform a gradient step in a given direction.
+   * @param stepSize initial step size for the first step
+   * @param numIterations number of iterations that SGD should be run.
+   * @param regParam regularization parameter
+   * @param miniBatchFraction fraction of the input data set that should be used for
+   *                          one iteration of SGD. Default value 1.0.
+   * @param convergenceTol Minibatch iteration will end before numIterations if the relative
+   *                       difference between the current weight and the previous weight is less
+   *                       than this value. In measuring convergence, L2 norm is calculated.
+   *                       Default value 0.001. Must be between 0.0 and 1.0 inclusively.
+   * @return A tuple containing two elements. The first element is a column matrix containing
+   *         weights for every feature, and the second element is an array containing the
+   *         stochastic loss computed for every iteration.
+   */
+  def runMiniBatchSGD(
+    data: RDD[(Double, Vector)],
+    gradient: Gradient,
+    updater: Updater,
+    stepSize: Double,
+    numIterations: Int,
+    regParam: Double,
+    miniBatchFraction: Double,
+    initialWeights: Vector,
+    convergenceTol: Double,
+    treeDepth: Int = 2): (Vector, Array[Double]) = {
+    import breeze.linalg.{DenseVector => BDV}
+
+    // convergenceTol should be set with non minibatch settings
+    if (miniBatchFraction < 1.0 && convergenceTol > 0.0) {
+      logWarning("Testing against a convergenceTol when using miniBatchFraction " +
+        "< 1.0 can be unstable because of the stochasticity in sampling.")
+    }
+
+    if (numIterations * miniBatchFraction < 1.0) {
+      logWarning("Not all examples will be used if numIterations * miniBatchFraction < 1.0: " +
+        s"numIterations=$numIterations and miniBatchFraction=$miniBatchFraction")
+    }
+
+    val stochasticLossHistory = new ArrayBuffer[Double](numIterations)
+    // Record previous weight and current one to calculate solution vector difference
+
+    var previousWeights: Option[Vector] = None
+    var currentWeights: Option[Vector] = None
+
+    val numExamples = data.count()
+
+    // if no data, return initial weights to avoid NaNs
+    if (numExamples == 0) {
+      logWarning("GradientDescent.runMiniBatchSGD returning initial weights, no data found")
+      return (initialWeights, stochasticLossHistory.toArray)
+    }
+
+    if (numExamples * miniBatchFraction < 1) {
+      logWarning("The miniBatchFraction is too small")
+    }
+
+    // Initialize weights as a column vector
+    var weights = Vectors.dense(initialWeights.toArray)
+    val n = weights.size
+
+    /**
+     * For the first iteration, the regVal will be initialized as sum of weight squares
+     * if it's L2 updater; for L1 updater, the same logic is followed.
+     */
+    var regVal = updater.compute(
+      weights, Vectors.zeros(weights.size), 0, 1, regParam)._2
+
+    var converged = false // indicates whether converged based on convergenceTol
+    var i = 1
+    while (!converged && i <= numIterations) {
+      val bcWeights = data.context.broadcast(weights)
+      // Sample a subset (fraction miniBatchFraction) of the total data
+      // compute and sum up the subgradients on this subset (this is one map-reduce)
+      val (gradientSum, lossSum, miniBatchSize, bcTime) = data.sample(false, miniBatchFraction, 42 + i)
+        .treeAggregate((BDV.zeros[Double](n), 0.0, 0L, 0L))(
+          seqOp = (c, v) => {
+            // c: (grad, loss, count, t), v: (label, features)
+            val s = System.currentTimeMillis()
+            val w = bcWeights.value
+            val t = System.currentTimeMillis() - s
+            val l = gradient.compute(v._2, v._1, w, Vectors.fromBreeze(c._1))
+            (c._1, c._2 + l, c._3 + 1, c._4 + t)
+          },
+          combOp = (c1, c2) => {
+            // c: (grad, loss, count, t)
+            (c1._1 += c2._1, c1._2 + c2._2, c1._3 + c2._3, c1._4 + c2._4)
+          }, treeDepth)
+
+      logWarning(s"BC read time: $bcTime ms")
+      if (miniBatchSize > 0) {
+        /**
+         * lossSum is computed using the weights from the previous iteration
+         * and regVal is the regularization value computed in the previous iteration as well.
+         */
+        stochasticLossHistory.append(lossSum / miniBatchSize + regVal)
+        val update = updater.compute(
+          weights, Vectors.fromBreeze(gradientSum / miniBatchSize.toDouble),
+          stepSize, i, regParam)
+        weights = update._1
+        regVal = update._2
+
+        previousWeights = currentWeights
+        currentWeights = Some(weights)
+        if (previousWeights != None && currentWeights != None) {
+          converged = isConverged(previousWeights.get,
+            currentWeights.get, convergenceTol)
+        }
+      } else {
+        logWarning(s"Iteration ($i/$numIterations). The size of sampled batch is zero")
+      }
+      i += 1
+    }
+
+    logInfo("GradientDescent.runMiniBatchSGD finished. Last 10 stochastic losses %s".format(
+      stochasticLossHistory.takeRight(10).mkString(", ")))
+
+    (weights, stochasticLossHistory.toArray)
+
+  }
+
+  /**
+   * Alias of [[runMiniBatchSGD]] with convergenceTol set to default value of 0.001.
+   */
+  def runMiniBatchSGD(
+    data: RDD[(Double, Vector)],
+    gradient: Gradient,
+    updater: Updater,
+    stepSize: Double,
+    numIterations: Int,
+    regParam: Double,
+    miniBatchFraction: Double,
+    initialWeights: Vector): (Vector, Array[Double]) =
+  GradientDescent.runMiniBatchSGD(data, gradient, updater, stepSize, numIterations,
+    regParam, miniBatchFraction, initialWeights, 0.001)
+
+
+  private def isConverged(
+    previousWeights: Vector,
+    currentWeights: Vector,
+    convergenceTol: Double): Boolean = {
+    import breeze.linalg.norm
+    // To compare with convergence tolerance.
+    val previousBDV = previousWeights.asBreeze.toDenseVector
+    val currentBDV = currentWeights.asBreeze.toDenseVector
+
+    // This represents the difference of updated weights in the iteration.
+    val solutionVecDiff: Double = norm(previousBDV - currentBDV)
+
+    solutionVecDiff < convergenceTol * Math.max(norm(currentBDV), 1.0)
+  }
+
 }

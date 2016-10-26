@@ -4,15 +4,12 @@ import org.json4s.DefaultFormats
 import org.json4s.JsonDSL._
 import org.json4s.jackson.JsonMethods._
 
-import scala.util.Random
-
-import org.apache.spark.{SparkContext, Logging}
+import org.apache.spark.SparkContext
 import org.apache.spark.mllib.linalg._
-import org.apache.spark.mllib.optimization.{Updater, Gradient}
-import org.apache.spark.rdd.RDD
-import org.apache.spark.storage.StorageLevel
+import org.apache.spark.mllib.optimization.{Gradient, Updater}
 import org.apache.spark.mllib.util.Loader._
 import org.apache.spark.mllib.util.{Loader, Saveable}
+import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, SQLContext}
 
 /**
@@ -32,7 +29,7 @@ class FMModel(val task: Int,
   val numFeatures = factorMatrix.numCols
   val numFactors = factorMatrix.numRows
 
-  require(numFeatures > 0 && numFactors > 0)
+  require(numFeatures > 0) // && numFactors > 0)
   require(task == 0 || task == 1)
 
   def predict(testData: Vector): Double = {
@@ -107,7 +104,7 @@ object FMModel extends Loader[FMModel] {
 
       // Create Parquet data.
       val dataRDD: DataFrame = sc.parallelize(Seq(data), 1).toDF()
-      dataRDD.saveAsParquetFile(dataPath(path))
+      dataRDD.write.parquet(dataPath(path))
     }
 
     def load(sc: SparkContext, path: String): FMModel = {
